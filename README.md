@@ -1,69 +1,93 @@
-# Kaggriculture agent + local lab
+# KaggriCulture
 
-## Setup
+A single-file Python agent for Kaggle's [Kaggriculture](https://www.kaggle.com/competitions/kaggriculture) simulation, plus a local lab for testing it.
+
+Kaggriculture is a two-player, 30-day farming and trading game (720 turns). Each player grows crops, raises animals, hires hands and sells into a shared market whose prices react to supply. The player with more coins after the last turn wins. Leaderboard rating counts only wins, losses and ties, not the margin.
+
+## Quick start
+
 ```bash
-pip install -U kaggle-environments   # >= 1.32 ships envs/kaggriculture (the real game engine)
+pip install -U kaggle-environments          # version 1.32 or later ships the game engine
+python run_match.py main.py starter -n 10    # 10 seeds, each played twice with sides swapped
+kaggle competitions submit kaggriculture -f main.py -m "my agent"
 ```
-The engine source is at `site-packages/kaggle_environments/envs/kaggriculture/kaggriculture.py`.
-Read it: several rules differ from the web page (see "Engine facts" below).
+
+The engine source, `kaggle_environments/envs/kaggriculture/kaggriculture.py`, is the ground truth for the rules. Several details differ from the competition web page.
 
 ## Files
-| file | purpose |
-|---|---|
-| `main.py` | the agent (single file, no dependencies). Submit this. |
-| `run_match.py` | tournament: `python run_match.py main.py starter -n 10` (each seed played twice, sides swapped) |
-| `trace.py` | per-day summary of one game: money, tile mix, hands, prices |
-| `losses.py` | counts dead crops / escaped animals: `python losses.py main.py starter 2000 3` |
-| `variant.py`, `sweep.sh` | parameter A/B: `./sweep.sh 6 7000 'name:{"cap_lambda":0.3}'` (variants vs `var/base.py`) |
 
-## Workflow
-1. `cp main.py var/base.py` (freeze the current best)
-2. edit `main.py`
-3. `python run_match.py main.py var/base.py -n 8` → keep the change if the win rate is clearly > 50%
-4. `kaggle competitions submit kaggriculture -f main.py -m "vX"`
+| File | Purpose |
+|---|---|
+| `main.py` | The agent. One file, no dependencies. This is what you submit. |
+| `sim.py` | Fast simulator that drives the real engine without Kaggle's per-step copies. About 4× faster than `kaggle_environments`, with identical results. |
+| `ev.py` | Benchmark. Ghost races against recorded top-team games plus head-to-head games against a reference agent, reported with standard errors. |
+| `ghost.py` | Ghost race against one recorded replay, using the recorded shops and weeds. |
+| `run_match.py` | Head-to-head tournament on the full Kaggle environment, sides swapped. |
+| `variant.py`, `sweep.sh` | Make agent variants with `PARAMS` overrides and sweep them. |
+| `trace.py`, `losses.py`, `icefire.py` | Per-day game summaries, dead crops and escaped animals, and top-team analysis. |
+| `1153*.json`, `replays/` | Recorded ladder games used for ghost races. |
 
 ## How the agent works
-1. **Market model**: exact price curves, expected town consumption (known shops + expected future shops),
-   and pending supply from *both* farms (the opponent's farm is visible).
-2. **Tile planner**: every free tile gets the crop/animal with the best value per tile-day at projected
-   prices, after a capital charge; cash is held back so every tile gets planted.
-3. **Jobs**: each tile lists its needed actions with a $ value (a plant that dies tonight if not watered
-   is worth its whole expected yield; an unfed animal that escapes tonight is worth ~$490).
-4. **Scheduler**: sticky assignment; free units pick the job with the highest value per turn spent.
-   Units grab feed wheat at the shed at the start of the day.
-5. **Market**: sell every turn (hold only when a price is forecast to rise), hire by workload,
-   buy land when the current land is full, buy animals only for built structures, fertilize tomatoes and
-   strawberries on production days.
 
-## Engine facts that matter (from the source)
-- Kaggle calls the **last callable** in `main.py` → `agent` must be defined last.
-- Step 718 (day 29, hour 22) is the last processed step. End-of-day drops never happen on the last day.
-- One-time crops start decaying at age `max_yield_day + 1`. Melon can't be harvested before age 10,
-  so fertilizing melons gains nothing.
-- The ongoing-crop held cap is `max_yield` (4). Harvest often when fertilized.
-- FEED needs wheat in *that unit's* inventory. PLACE needs the animal in the inventory. SELL only sells from the shed.
-- A DROP and a SELL in the same turn work (unit actions are processed before market orders).
-- Every animal yields 1 fertilizer/day (~$90 early) → animals pay back fast.
+`main.py` has three layers. Every tunable knob lives in the `PARAMS` dict at the top of the file.
+
+### 1. Market model
+
+- **Exact prices.** It uses the engine's price curves.
+- **Projected inventory.** For every product and every remaining day, it projects market inventory from three things: town demand, both farms' production schedules, and the shops that are open or still expected. The opponent's farm is visible, so its supply is included.
+- **New production.** A new crop or animal is valued at the projected price on the days it actually sells. It is also charged for how much its sales will lower the price of our own later sales.
+
+### 2. Planner
+
+- **Choosing what to plant.** Each free tile gets the crop or animal with the best value per tile-day after a capital charge. The planner saves cash when an unaffordable option is much better.
+- **Land.** Land is bought on a fixed schedule: steps 147, 198 and 250.
+- **Hands.** Hiring follows a daily minimum schedule. The marginal hand is capped at $150 a day because hand costs grow as a Fibonacci sequence.
+- **Early strawberries.** Strawberries are pushed onto tiles freed by the early wheat harvest on days 2–7.
+
+### 3. Scheduler and market orders
+
+- **Nearest job first.** Each worker takes the nearest useful job (score = value / distance¹⁰). This roughly halved the walking of the earlier value-per-turn scheduler.
+- **Urgent jobs.** A crop that would die tonight or an animal that would escape tonight pulls in the nearest worker when 2 hours or less of slack remain. Workers also water or feed urgent tiles they walk over.
+- **Animals in the shed.** Animals waiting in the shed are carried straight to their empty coop or pasture.
+- **Pocket goods.** Goods stay in workers' pockets, since the engine drops them into the shed at night. Workers walk them back early only when cash is short, or after 5 pm to sell them that evening.
+- **Sell orders.** Both players' orders are processed in parallel by their position in the order list, and each sale lowers the price. The agent lists first the goods whose price would fall the most from its own sale, so it sells before the opponent does.
 
 ## Results (local)
-- vs built-in `starter`: 100% wins, ~$80–110k vs ~$3.5k
-- vs its own earlier versions: v8 beats v4 11/1
 
-## Next ideas (highest expected value first)
-1. Download top-ladder replays (`kaggle competitions replay <id>`), run `trace.py`-style analysis on them, copy what works.
-2. Opponent-aware selling: sell premium goods (melon/milk/wool/strawberry) *before* the opponent's visible harvests land.
-3. Zone-based routing (fixed sweeps per unit) to cut walking further; ~50% of actions are still moves.
-4. Tune `PARAMS` with larger sweeps (≥20 seeds per variant; 10-game results are noise).
-5. Grow our own feed wheat instead of buying it when the wheat price is high.
+| Test | Result |
+|---|---|
+| vs the original agent in this repo, head-to-head | 40/40 wins, $99.7k vs $83.1k on average |
+| vs the version just before, head-to-head | 44/80 wins, +$0.6k on average |
+| Ghost race vs 5 DECEM (ladder #1) replays | wins most games, but DECEM's recorded moves go off track against a new opponent, so this overstates our strength |
+| Ghost race vs 5 non-drifting top-team replays (DSM, Yizhou, Boey) | ~$88k vs ~$130k, still loses |
 
-## Learning from top teams (Ice & Fire)
+## Testing a change
+
 ```bash
-kaggle competitions replay <EPISODE_ID> -p replays          # collect 20-50 episodes of one team
-python ghost.py "replays/*.json" main.py --summary           # race your agent vs their recorded games
-python icefire.py "replays/*.json" --team Majkel1337 --mine main.py --games 12   # ice/fire, land timing, money curve: theirs vs yours
-python icefire.py "replays/*.json" --team Majkel1337 --export-opening opening.json --min-share 0.6
-python icefire.py --embed opening.json main.py main_opening.py   # play their opening, then hand over to your agent
-python run_match.py main_opening.py main.py -n 10              # keep it only if it wins
+cp main.py var/base.py                                     # freeze the current best
+# edit main.py, or make a variant:
+python variant.py var/try.py '{"evening_hour": 15}' main.py
+python ev.py var/try.py --ghost clean -w 2 --h2h var/base.py -n 40
 ```
-Local test: a 97-step extracted opening lifted the old v4 agent 12/0 vs plain v4.
-Copying Majkel1337's land timing alone (PARAMS land_steps=[150,218,222]) LOST 1/11: copy coherent packages, then verify.
+
+Keep a change only if it clearly wins. Head-to-head differences under about $1.5k, or ghost differences under about $3k, are noise.
+
+## Rules of the engine that matter
+
+- **Last callable.** Kaggle calls the last callable in `main.py`, so `agent` must be defined last. It must never raise.
+- **Last step.** Step 718 (day 29, hour 22) is the last processed step. Unsold goods are worth nothing.
+- **Hour 23.** Actions at hour 23 count on every day except the last.
+- **Crop decay.** One-time crops start decaying at age `max_yield_day + 1`. Fertilizing melons gains nothing.
+- **Inventories.** FEED needs wheat in that unit's own inventory. PLACE needs the animal in the inventory. SELL only sells from the shed.
+- **Same-turn sales.** Unit actions resolve before market orders, so a DROP and a SELL in the same turn both work.
+- **Fertilizer.** Every animal yields 1 fertilizer per day. Fertilizer has no town demand, so its price only falls as both players sell it.
+
+## Known gap and next steps
+
+The top teams out-earn this agent mainly through timing and plans chosen for each set of opening shops, not through faster work. When our agent was given a top team's exact planting plan, it still earned about $98k against their $155k. They spend nearly all their cash in days 1–10 and pick their animals and crops from the first two shops. They also switch to stable-priced crops (tomatoes, eggs, wheat, carrots) once premium prices crash.
+
+The most promising next steps:
+
+1. **Early cash-flow model.** Rank purchases by payback so cash compounds in days 1–10.
+2. **Strategies per opening-shop pair.** Tune a separate strategy offline for each pair of opening shops and select it on day 6.
+3. **Opponent-aware forecast.** Predict the opponent's future plantings so we stop over-planting crops that are about to crash.
